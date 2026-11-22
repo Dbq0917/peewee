@@ -7,6 +7,11 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add SQLite support for `SchemaMigrator.add_foreign_key_constraint()`,
+  `alter_foreign_key_constraint()`, and `drop_foreign_key_constraint()`.
+  Rebuilding the table preserves existing rows, indexes, and triggers, so
+  changing a foreign key to `ON DELETE CASCADE` does not remove historical
+  data.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.

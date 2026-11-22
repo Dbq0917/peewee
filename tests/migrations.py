@@ -1140,6 +1140,86 @@ class TestSchemaMigration(ModelTestCase):
         User.delete().where(User.id == 'huey').execute()
         self.assertEqual(Page.select().count(), 0)
 
+    @requires_sqlite
+    def test_sqlite_alter_fk_preserves_history(self):
+        db = self.database
+        tables = ('migrate_order', 'migrate_item')
+        db.execute_sql('DROP TABLE IF EXISTS "%s"' % tables[1])
+        db.execute_sql('DROP TABLE IF EXISTS "%s"' % tables[0])
+        db.execute_sql('CREATE TABLE "migrate_order" ('
+                       '"id" INTEGER NOT NULL PRIMARY KEY, "code" TEXT)')
+        db.execute_sql('CREATE TABLE "migrate_item" ('
+                       '"id" INTEGER NOT NULL PRIMARY KEY, '
+                       '"order_id" INTEGER NOT NULL REFERENCES '
+                       '"migrate_order" ("id") ON UPDATE CASCADE, '
+                       '"sku" TEXT)')
+        db.execute_sql('CREATE INDEX "migrate_item_order_id" '
+                       'ON "migrate_item" ("order_id")')
+        db.execute_sql('CREATE TRIGGER "migrate_item_bi" '
+                       'AFTER INSERT ON "migrate_item" BEGIN SELECT 1; END')
+        db.execute_sql('INSERT INTO "migrate_order" ("id", "code") '
+                       'VALUES (1, ?), (2, ?)', ('o1', 'o2'))
+        db.execute_sql('INSERT INTO "migrate_item" '
+                       '("id", "order_id", "sku") '
+                       'VALUES (1, 1, ?), (2, 1, ?), (3, 2, ?)',
+                       ('a', 'b', 'c'))
+
+        fks_enabled = db.pragma('foreign_keys')
+        db.pragma('foreign_keys', 1)
+        try:
+            migrate(self.migrator.alter_foreign_key_constraint(
+                'migrate_item', 'order_id', 'migrate_order', 'id',
+                on_delete='CASCADE'))
+
+            # Historical rows, index and trigger all survived the rebuild.
+            self.assertEqual(
+                list(db.execute_sql('SELECT "id", "order_id", "sku" '
+                                    'FROM "migrate_item" ORDER BY "id"')),
+                [(1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c')])
+            indexes = {idx.name: idx.columns
+                       for idx in db.get_indexes('migrate_item')}
+            self.assertEqual(indexes['migrate_item_order_id'], ['order_id'])
+            trigger = db.execute_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND "
+                "name = 'migrate_item_bi'").fetchone()
+            self.assertEqual(trigger, ('migrate_item_bi',))
+
+            fks = db.get_foreign_keys('migrate_item')
+            self.assertEqual(len(fks), 1)
+            self.assertEqual((fks[0].column, fks[0].dest_table,
+                              fks[0].dest_column, fks[0].on_delete,
+                              fks[0].on_update),
+                             ('order_id', 'migrate_order', 'id', 'CASCADE',
+                              'CASCADE'))
+            self.assertEqual(db.pragma('foreign_keys'), 1)
+
+            # Only the deleted order's historical detail rows are removed.
+            db.execute_sql('DELETE FROM "migrate_order" WHERE "id" = 1')
+            self.assertEqual(
+                list(db.execute_sql('SELECT "id", "order_id", "sku" '
+                                    'FROM "migrate_item"')),
+                [(3, 2, 'c')])
+
+            # The drop/add form also preserves the remaining history.
+            migrate(
+                self.migrator.drop_foreign_key_constraint(
+                    'migrate_item', 'order_id'),
+                self.migrator.add_foreign_key_constraint(
+                    'migrate_item', 'order_id', 'migrate_order', 'id',
+                    on_delete='CASCADE'))
+            self.assertEqual(
+                list(db.execute_sql('SELECT "id", "order_id", "sku" '
+                                    'FROM "migrate_item"')),
+                [(3, 2, 'c')])
+            db.execute_sql('DELETE FROM "migrate_order" WHERE "id" = 2')
+            self.assertEqual(
+                db.execute_sql('SELECT COUNT(*) FROM "migrate_item"')
+                .fetchone()[0], 0)
+        finally:
+            db.pragma('foreign_keys', fks_enabled)
+            db.execute_sql('DROP TABLE IF EXISTS "migrate_item"')
+            db.execute_sql('DROP TABLE IF EXISTS "migrate_order"')
+
     def test_from_database_proxy(self):
         proxy = DatabaseProxy()
         proxy.initialize(self.database)

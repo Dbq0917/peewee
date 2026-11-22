@@ -309,6 +309,29 @@ default:
        migrator.add_column('tweet', 'user_id', user_fk),
    )
 
+Alter or drop a foreign key
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``alter_foreign_key_constraint()`` to change the referential actions on
+an existing foreign key without dropping and re-adding the column:
+
+.. code-block:: python
+
+   migrate(
+       migrator.alter_foreign_key_constraint(
+           'order_item', 'order_id', 'order', 'id',
+           on_delete='CASCADE'),
+   )
+
+``add_foreign_key_constraint()`` and ``drop_foreign_key_constraint()`` are
+also available. On SQLite these operations rebuild the table while copying
+every existing row, then restore its indexes and triggers. Foreign-key
+enforcement is disabled for the duration of the rebuild and restored
+afterwards, so the rebuild itself cannot cascade-delete historical rows.
+SQLite only enforces the resulting constraint when the ``foreign_keys``
+pragma is enabled on the connection, e.g.
+``SqliteDatabase(..., pragmas={'foreign_keys': 1})``.
+
 Rename a column
 ~~~~~~~~~~~~~~~
 
@@ -526,6 +549,22 @@ Migration API
       :param str table: Name of the table to drop column from.
       :param str column_name: Name of the column to drop.
       :param bool cascade: Whether the column should be dropped with `CASCADE`.
+
+   .. method:: add_foreign_key_constraint(table, column_name, rel, rel_column, on_delete=None, on_update=None, constraint_name=None, rel_schema=None)
+
+      Add a foreign key constraint to an existing column. If the column
+      already has a foreign key, it is replaced. On SQLite the table is
+      rebuilt and all existing rows, indexes, and triggers are preserved.
+
+   .. method:: alter_foreign_key_constraint(table, column_name, rel, rel_column, on_delete=None, on_update=None, constraint_name=None, rel_schema=None)
+
+      Replace the foreign key constraint on an existing column. This is the
+      preferred way to change ``ON DELETE`` or ``ON UPDATE`` behavior without
+      losing the column's historical values.
+
+   .. method:: drop_foreign_key_constraint(table, column_name)
+
+      Drop the foreign key constraint associated with the given column.
 
    .. method:: rename_column(table, old_name, new_name)
 

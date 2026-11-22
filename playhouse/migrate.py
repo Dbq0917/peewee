@@ -343,6 +343,16 @@ class SchemaMigrator(object):
         return ctx
 
     @operation
+    def alter_foreign_key_constraint(self, table, column_name, rel, rel_column,
+                                     on_delete=None, on_update=None,
+                                     constraint_name=None, rel_schema=None):
+        return (
+            self.drop_foreign_key_constraint(table, column_name),
+            self.add_foreign_key_constraint(
+                table, column_name, rel, rel_column, on_delete, on_update,
+                constraint_name, rel_schema))
+
+    @operation
     def add_column(self, table, column_name, field, allow_not_null=False):
         field = field.clone()
         # Adding a column is complicated by the fact that if there are rows
@@ -769,6 +779,18 @@ class SqliteMigrator(SchemaMigrator):
     column_split_re = re.compile(r'(?:[^,(]|\([^)]*\))+')
     column_name_re = re.compile(r'''["`']?([\w]+)''')
     fk_re = re.compile(r'FOREIGN KEY\s+\("?([\w]+)"?\)\s+', re.I)
+    fk_def_re = re.compile(
+        r'^\s*(?:CONSTRAINT\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|\S+)\s+)?'
+        r'FOREIGN\s+KEY\s*\(([^)]*)\)\s*REFERENCES\b',
+        re.I)
+    inline_fk_re = re.compile(
+        r'\s+REFERENCES\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|\w+)'
+        r'\s*(?:\([^)]*\))?'
+        r'(?:\s+ON\s+(?:DELETE|UPDATE)\s+'
+        r'(?:CASCADE|RESTRICT|NO\s+ACTION|SET\s+NULL|SET\s+DEFAULT))*'
+        r'(?:\s+DEFERRABLE(?:\s+INITIALLY\s+'
+        r'(?:DEFERRED|IMMEDIATE))?)?(?=\s|$)',
+        re.I)
 
     def __init__(self, *args, **kwargs):
         super(SqliteMigrator, self).__init__(*args, **kwargs)
@@ -794,6 +816,170 @@ class SqliteMigrator(SchemaMigrator):
              'where type=? and LOWER(name)=?'),
             ['table', table.lower()])
         return res.fetchone()
+
+    def _make_foreign_key_constraint(self, table, column_name, rel,
+                                     rel_column, on_delete, on_update,
+                                     constraint_name, rel_schema):
+        name = constraint_name or 'fk_%s_%s_refs_%s' % (
+            table, column_name, rel)
+        node = NodeList([
+            SQL('CONSTRAINT'),
+            Entity(_truncate_constraint_name(name)),
+            SQL('FOREIGN KEY'),
+            EnclosedNodeList((Entity(column_name),)),
+            SQL('REFERENCES'),
+            self._table(rel, rel_schema),
+            EnclosedNodeList((Entity(rel_column),))])
+        if on_delete is not None:
+            node = NodeList((node, SQL('ON DELETE %s' % on_delete)))
+        if on_update is not None:
+            node = NodeList((node, SQL('ON UPDATE %s' % on_update)))
+        sql, _ = self.make_context().sql(node).query()
+        return sql.strip()
+
+    def _rebuild_table(self, table, raw_create, column_defs,
+                       original_column_names, new_column_names, indexes,
+                       triggers):
+        # Update the name of the new CREATE TABLE query.
+        temp_table = table + '__tmp__'
+        rgx = re.compile(r'("?)%s("?)\s*$' % re.escape(table), re.I)
+        create = rgx.sub(r'\1%s\2' % temp_table, raw_create)
+
+        # Create the new table and copy all rows into it. Keep foreign-key
+        # enforcement off until the original table has been replaced, so the
+        # rebuild itself can never fire ON DELETE CASCADE.
+        columns = ', '.join(column_defs)
+        queries = [
+            NodeList([SQL('DROP TABLE IF EXISTS'), Entity(temp_table)]),
+            SQL('%s (%s)' % (create.strip(), columns))]
+
+        populate_table = NodeList((
+            SQL('INSERT INTO'),
+            Entity(temp_table),
+            EnclosedNodeList([Entity(col) for col in new_column_names]),
+            SQL('SELECT'),
+            CommaNodeList([Entity(col) for col in original_column_names]),
+            SQL('FROM'),
+            Entity(table)))
+        rename_table = (self
+                        ._alter_table(self.make_context(), temp_table)
+                        .literal(' RENAME TO ')
+                        .sql(Entity(table)))
+        queries += [
+            populate_table,
+            NodeList([SQL('DROP TABLE'), Entity(table)]),
+            rename_table]
+
+        for index in filter(lambda idx: idx.sql, indexes):
+            queries.append(SQL(index.sql))
+        queries.extend(SQL(sql) for sql, in triggers)
+
+        with self.migration_context():
+            for query in queries:
+                self.database.execute(query)
+
+    def _foreign_key_args(self, rel, rel_column, on_delete, on_update,
+                          constraint_name):
+        if isinstance(rel, ForeignKeyField):
+            field = rel
+            if rel_column is not None:
+                # Support the historical (..., field, on_delete) signature.
+                if on_delete is None:
+                    on_delete = rel_column
+                elif on_update is None:
+                    on_update = rel_column
+            rel = field.rel_model._meta.table_name
+            rel_column = field.rel_field.column_name
+            if on_delete is None:
+                on_delete = field.on_delete
+            if on_update is None:
+                on_update = field.on_update
+            if constraint_name is None:
+                constraint_name = field.constraint_name
+        elif isinstance(rel, type) and issubclass(rel, Model):
+            rel = rel._meta.table_name
+
+        if isinstance(rel_column, Field):
+            rel_column = rel_column.column_name
+
+        if rel is None or rel_column is None:
+            raise ValueError('Foreign key must specify a related table and '
+                             'column.')
+        return rel, rel_column, on_delete, on_update, constraint_name
+
+    def _alter_foreign_key_constraint(self, table, column_name, rel=None,
+                                      rel_column=None, on_delete=None,
+                                      on_update=None, constraint_name=None,
+                                      rel_schema=None):
+        columns = set(column.name.lower()
+                      for column in self.database.get_columns(table))
+        if column_name.lower() not in columns:
+            raise ValueError('Column "%s" does not exist on "%s"' %
+                             (column_name, table))
+
+        table, create_table = self._get_create_table(table)
+        indexes = self.database.get_indexes(table)
+        triggers = self.database.execute_sql(
+            'select sql from sqlite_master where type=? and LOWER(tbl_name)=?',
+            ['trigger', table.lower()]).fetchall()
+
+        create_table = re.sub(r'\s+', ' ', create_table)
+        raw_create, raw_columns = self.column_re.search(
+            create_table).groups()
+        column_defs = [col.strip()
+                       for col in self.column_split_re.findall(raw_columns)]
+
+        constraint_terms = ('foreign ', 'primary ', 'constraint ', 'check ',
+                            'unique ')
+        original_column_names = []
+        cleaned_columns = []
+        found = False
+        target = column_name.lower()
+
+        if rel is not None:
+            rel, rel_column, on_delete, on_update, constraint_name = \
+                self._foreign_key_args(rel, rel_column, on_delete, on_update,
+                                       constraint_name)
+            existing = [fk for fk in self.database.get_foreign_keys(table)
+                        if fk.column.lower() == target]
+            if existing:
+                if on_delete is None:
+                    on_delete = existing[0].on_delete
+                if on_update is None:
+                    on_update = existing[0].on_update
+
+        for column_def in column_defs:
+            match = self.fk_def_re.match(column_def)
+            if match is not None:
+                names = [part.strip().strip('"`[]\' ')
+                         for part in match.group(1).split(',')]
+                if target in [name.lower() for name in names]:
+                    found = True
+                    continue
+            else:
+                match = self.column_name_re.match(column_def)
+                if match is not None:
+                    name = match.group(1)
+                    if not column_def.lower().startswith(constraint_terms):
+                        original_column_names.append(name)
+                    if name.lower() == target and \
+                            self.inline_fk_re.search(column_def):
+                        found = True
+                        column_def = self.inline_fk_re.sub('', column_def)
+
+            cleaned_columns.append(column_def)
+
+        if rel is not None:
+            cleaned_columns.append(self._make_foreign_key_constraint(
+                table, column_name, rel, rel_column, on_delete, on_update,
+                constraint_name, rel_schema))
+        elif not found:
+            raise ValueError('Unable to find foreign key constraint for '
+                             '"%s"."%s".' % (table, column_name))
+
+        self._rebuild_table(table, raw_create, cleaned_columns,
+                            original_column_names, original_column_names,
+                            indexes, triggers)
 
     @operation
     def _update_column(self, table, column_to_update, fn):
@@ -1054,9 +1240,32 @@ class SqliteMigrator(SchemaMigrator):
         raise NotImplementedError
 
     @operation
-    def add_foreign_key_constraint(self, table, column_name, field,
-                                   on_delete=None, on_update=None):
-        raise NotImplementedError
+    def add_foreign_key_constraint(self, table, column_name, rel=None,
+                                   rel_column=None,
+                                   on_delete=None, on_update=None,
+                                   constraint_name=None, rel_schema=None,
+                                   field=None):
+        if rel is None:
+            rel = field
+        self._alter_foreign_key_constraint(
+            table, column_name, rel, rel_column, on_delete, on_update,
+            constraint_name, rel_schema)
+
+    @operation
+    def drop_foreign_key_constraint(self, table, column_name):
+        self._alter_foreign_key_constraint(table, column_name)
+
+    @operation
+    def alter_foreign_key_constraint(self, table, column_name, rel=None,
+                                     rel_column=None,
+                                     on_delete=None, on_update=None,
+                                     constraint_name=None, rel_schema=None,
+                                     field=None):
+        if rel is None:
+            rel = field
+        self._alter_foreign_key_constraint(
+            table, column_name, rel, rel_column, on_delete, on_update,
+            constraint_name, rel_schema)
 
 
 def migrate(*operations, **kwargs):
