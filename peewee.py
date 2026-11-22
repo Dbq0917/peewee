@@ -3693,6 +3693,7 @@ class Database(_callable_context_manager):
     index_using_precedes_table = False
     index_value_literals = False
     limit_max = None
+    max_variables = None
     nulls_ordering = False
     returning_clause = False
     safe_create_index = True
@@ -4162,6 +4163,8 @@ class SqliteDatabase(Database):
     index_schema_prefix = True
     index_value_literals = True
     limit_max = -1
+    # SQLITE_MAX_VARIABLE_NUMBER was raised from 999 to 32766 in 3.32.0.
+    max_variables = 32766 if __sqlite_version__ >= (3, 32, 0) else 999
     server_version = __sqlite_version__
     truncate_table = False
     json_methods = SqliteJSONMethods
@@ -7814,15 +7817,26 @@ class Model(Node, metaclass=ModelBase):
 
     @classmethod
     def bulk_create(cls, model_list, batch_size=None):
-        if batch_size is not None:
-            batches = chunked(model_list, batch_size)
-        else:
-            batches = [model_list]
-
         field_names = list(cls._meta.sorted_field_names)
         if cls._meta.auto_increment:
             pk_name = cls._meta.primary_key.name
             field_names.remove(pk_name)
+
+        fields = [cls._meta.fields[field_name] for field_name in field_names]
+        attrs = [field.safe_name for field in fields]
+
+        # Ensure each batch stays within the database's limit on the number
+        # of variables (parameters) in a single query.
+        max_variables = cls._meta.database.max_variables
+        if max_variables and fields:
+            max_batch = max(1, max_variables // len(fields))
+            if batch_size is None or batch_size > max_batch:
+                batch_size = max_batch
+
+        if batch_size is not None:
+            batches = chunked(model_list, batch_size)
+        else:
+            batches = [model_list]
 
         if cls._meta.database.returning_clause and \
            cls._meta.primary_key is not False:
@@ -7830,17 +7844,17 @@ class Model(Node, metaclass=ModelBase):
         else:
             pk_fields = None
 
-        fields = [cls._meta.fields[field_name] for field_name in field_names]
-        attrs = [field.safe_name for field in fields]
-
-        for batch in batches:
-            accum = ([getattr(model, f) for f in attrs]
-                     for model in batch)
-            res = cls.insert_many(accum, fields=fields).execute()
-            if pk_fields and res is not None:
-                for row, model in zip(res, batch):
-                    for (pk_field, obj_id) in zip(pk_fields, row):
-                        setattr(model, pk_field.name, obj_id)
+        # Run the batches in a single transaction so that a failure does not
+        # leave a subset of the rows inserted.
+        with cls._meta.database.atomic():
+            for batch in batches:
+                accum = ([getattr(model, f) for f in attrs]
+                         for model in batch)
+                res = cls.insert_many(accum, fields=fields).execute()
+                if pk_fields and res is not None:
+                    for row, model in zip(res, batch):
+                        for (pk_field, obj_id) in zip(pk_fields, row):
+                            setattr(model, pk_field.name, obj_id)
 
     @classmethod
     def bulk_update(cls, model_list, fields, batch_size=None):
@@ -7854,6 +7868,16 @@ class Model(Node, metaclass=ModelBase):
         # Now collect list of attribute names to use for values.
         attrs = [field.safe_name for field in fields]
 
+        # Each row requires 2 parameters per field (the CASE ... WHEN
+        # expressions) plus 1 for the primary-key IN () lookup. Ensure each
+        # batch stays within the database's limit on the number of variables
+        # (parameters) in a single query.
+        max_variables = cls._meta.database.max_variables
+        if max_variables:
+            max_batch = max(1, max_variables // (2 * len(fields) + 1))
+            if batch_size is None or batch_size > max_batch:
+                batch_size = max_batch
+
         if batch_size is not None:
             batches = chunked(model_list, batch_size)
         else:
@@ -7862,19 +7886,22 @@ class Model(Node, metaclass=ModelBase):
         n = 0
         pk = cls._meta.primary_key
 
-        for batch in batches:
-            id_list = [model._pk for model in batch]
-            update = {}
-            for field, attr in zip(fields, attrs):
-                accum = []
-                for model in batch:
-                    value = getattr(model, attr)
-                    if not isinstance(value, Node):
-                        value = field.case_value(value)
-                    accum.append((pk.to_value(model._pk), value))
-                update[field] = Case(pk, accum)
+        # Run the batches in a single transaction so that a failure does not
+        # leave a subset of the rows updated.
+        with cls._meta.database.atomic():
+            for batch in batches:
+                id_list = [model._pk for model in batch]
+                update = {}
+                for field, attr in zip(fields, attrs):
+                    accum = []
+                    for model in batch:
+                        value = getattr(model, attr)
+                        if not isinstance(value, Node):
+                            value = field.case_value(value)
+                        accum.append((pk.to_value(model._pk), value))
+                    update[field] = Case(pk, accum)
 
-            n += cls.update(update).where(pk.in_(id_list)).execute()
+                n += cls.update(update).where(pk.in_(id_list)).execute()
         return n
 
     @classmethod

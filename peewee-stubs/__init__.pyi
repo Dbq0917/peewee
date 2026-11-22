@@ -837,6 +837,7 @@ class Database(_callable_context_manager):
     index_using_precedes_table: bool
     index_value_literals: bool
     limit_max: int | None
+    max_variables: int | None
     nulls_ordering: bool
     returning_clause: bool
     safe_create_index: bool
@@ -929,6 +930,7 @@ class SqliteDatabase(Database):
     index_schema_prefix: bool
     index_value_literals: bool
     limit_max: int
+    max_variables: int
     server_version: Incomplete
     truncate_table: bool
     nulls_ordering: bool

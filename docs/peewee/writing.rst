@@ -246,13 +246,18 @@ Bulk-creating model instances
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 :meth:`~Model.bulk_create` accepts a list of unsaved model instances and
-inserts them efficiently. Pass ``batch_size`` to avoid hitting database limits:
+inserts them efficiently. The rows are inserted in a single transaction, so a
+failure will not leave a subset of the rows inserted. Pass ``batch_size`` to
+split the insert into smaller batches:
 
 .. code-block:: python
 
    users = [User(username=f'user_{i}') for i in range(1000)]
-   with db.atomic():
-       User.bulk_create(users, batch_size=100)
+   User.bulk_create(users, batch_size=100)
+
+Peewee automatically reduces the batch size, when necessary, to stay within
+the database's limit on the number of parameters in a single query
+(``Database.max_variables``, which is set automatically for SQLite).
 
 If you are using Postgresql (or SQLite with ``returning_clause=True``), then
 the previously-unsaved model instances will have their new primary key
@@ -397,12 +402,17 @@ fields across all of them in one query, use :meth:`~Model.bulk_update`:
    User.bulk_update([u1, u2, u3], fields=[User.username])
 
 This emits a single UPDATE using a SQL ``CASE`` expression. For large lists,
-specify a ``batch_size`` and wrap in a transaction:
+specify a ``batch_size`` to split the update into smaller batches. The
+batches are run in a single transaction, so a failure will not leave a
+subset of the rows updated:
 
 .. code-block:: python
 
-   with db.atomic():
-       User.bulk_update(users, fields=[User.username], batch_size=50)
+   User.bulk_update(users, fields=[User.username], batch_size=50)
+
+Peewee automatically reduces the batch size, when necessary, to stay within
+the database's limit on the number of parameters in a single query
+(``Database.max_variables``, which is set automatically for SQLite).
 
 ``bulk_update`` may be slower than a direct UPDATE query when the list is
 very large, because the generated ``CASE`` expression grows proportionally.

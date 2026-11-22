@@ -529,6 +529,82 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(t2.timestamp, datetime.datetime(2019, 1, 3, 0, 0, 0))
         self.assertEqual(t3.timestamp, t3_dt)
 
+    @requires_models(Person)
+    def test_bulk_update_many_rows(self):
+        people = [Person(first='f%04d' % i, last='l%04d' % i,
+                         dob=datetime.date(1980, 1, 1))
+                  for i in range(1000)]
+        Person.bulk_create(people)
+
+        people = list(Person.select().order_by(Person.id))
+        for person in people:
+            person.first += '-x'
+            person.last += '-x'
+
+        # Force a low variable limit so the update is split into batches of
+        # 199 rows (999 // 5 params-per-row), i.e. 6 UPDATE queries, all run
+        # in a single transaction.
+        max_variables = self.database.max_variables
+        self.database.max_variables = 999
+        try:
+            with self.assertQueryCount(6):
+                n = Person.bulk_update(people, ['first', 'last'])
+        finally:
+            self.database.max_variables = max_variables
+
+        self.assertEqual(n, 1000)
+        query = Person.select().order_by(Person.id)
+        self.assertEqual([(p.first, p.last) for p in query],
+                         [('f%04d-x' % i, 'l%04d-x' % i) for i in range(1000)])
+
+    @requires_models(Person)
+    def test_bulk_update_many_rows_atomic(self):
+        people = [Person(first='f%04d' % i, last='l%04d' % i,
+                         dob=datetime.date(1980, 1, 1))
+                  for i in range(1000)]
+        Person.bulk_create(people)
+
+        people = list(Person.select().order_by(Person.id))
+        for person in people:
+            person.first += '-x'
+            person.last += '-x'
+
+        # Introduce a conflict that will only trigger in a later batch.
+        people[900].first = people[100].first
+        people[900].last = people[100].last
+
+        max_variables = self.database.max_variables
+        self.database.max_variables = 999
+        try:
+            with self.assertRaises(IntegrityError):
+                Person.bulk_update(people, ['first', 'last'])
+        finally:
+            self.database.max_variables = max_variables
+
+        # The failed batch rolls back the whole update - no partial changes.
+        query = Person.select().order_by(Person.id)
+        self.assertEqual([(p.first, p.last) for p in query],
+                         [('f%04d' % i, 'l%04d' % i) for i in range(1000)])
+
+    @requires_models(User)
+    def test_bulk_create_many_rows(self):
+        users = [User(username='u%04d' % i) for i in range(1000)]
+
+        # Force a low variable limit so the insert is split into batches of
+        # 999 rows (1 param-per-row).
+        max_variables = self.database.max_variables
+        self.database.max_variables = 999
+        try:
+            with self.assertQueryCount(2):
+                User.bulk_create(users)
+        finally:
+            self.database.max_variables = max_variables
+
+        self.assertEqual(User.select().count(), 1000)
+        self.assertEqual(
+            [u.username for u in User.select().order_by(User.id)],
+            ['u%04d' % i for i in range(1000)])
+
     @skip_if(IS_MYSQL or IS_CRDB)
     @requires_models(CPK)
     def test_bulk_update_cte(self):

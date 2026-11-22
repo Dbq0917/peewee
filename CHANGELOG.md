@@ -7,6 +7,11 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* `Model.bulk_create()` and `Model.bulk_update()` cap the batch size so the
+  total number of query parameters stays within the database's limit
+  (`Database.max_variables`, set automatically for SQLite based on the
+  linked library version), and run all batches in a single transaction so a
+  failure cannot leave a subset of the rows written.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.
