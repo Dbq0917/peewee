@@ -306,6 +306,14 @@ you want to update:
    charlie.username = 'charlie_v2'
    charlie.save(only=[User.username])
 
+Scoping the UPDATE to changed fields also prevents lost updates when two
+requests edit the same row concurrently: a full-row ``save()`` writes back
+every column the instance was loaded with, so the second writer can silently
+restore a stale value in a column another request changed in the meantime.
+With ``only_save_dirty`` (or an explicit ``only=[...]``), each UPDATE contains
+only the columns that request actually modified, leaving the other columns
+untouched.
+
 Updating multiple rows
 ^^^^^^^^^^^^^^^^^^^^^^
 

@@ -2121,6 +2121,11 @@ class AutoCounter(TestModel):
     control = IntegerField(default=1)
 
 
+class WorkTicket(TestModel):
+    note = TextField(default='')
+    status = CharField(default='open')
+
+
 class TestDefaultDirtyBehavior(ModelTestCase):
     requires = [AutoCounter]
 
@@ -2186,6 +2191,94 @@ class TestDefaultDirtyBehavior(ModelTestCase):
         finally:
             # Reset only_save_dirty property for other tests.
             Person._meta.only_save_dirty = False
+
+
+class TestConcurrentPartialUpdate(ModelTestCase):
+    # Two operators edit the same ticket: one changes the note while the
+    # other changes the status. A full-row save by the second writer would
+    # clobber the field the first writer changed (lost update).
+    requires = [WorkTicket]
+
+    def tearDown(self):
+        super(TestConcurrentPartialUpdate, self).tearDown()
+        WorkTicket._meta.only_save_dirty = False
+
+    def _concurrent_edits(self):
+        ticket = WorkTicket.create(note='original note', status='open')
+        start = threading.Barrier(2)
+        note_saved = threading.Event()
+        errors = []
+
+        def edit_note():
+            try:
+                instance = WorkTicket.get_by_id(ticket.id)
+                start.wait()
+                instance.note = 'note from operator A'
+                instance.save()
+                note_saved.set()
+            except Exception as exc:
+                errors.append(exc)
+
+        def edit_status():
+            try:
+                instance = WorkTicket.get_by_id(ticket.id)
+                start.wait()
+                note_saved.wait()
+                instance.status = 'resolved'
+                instance.save()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=edit_note),
+                   threading.Thread(target=edit_status)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        return WorkTicket.get_by_id(ticket.id)
+
+    def test_full_row_save_loses_concurrent_field_update(self):
+        # Baseline reproducing the bug: both instances were loaded before
+        # either save, so the status writer's full-row UPDATE writes the
+        # stale note back and the note edit is lost.
+        WorkTicket._meta.only_save_dirty = False
+
+        final = self._concurrent_edits()
+        self.assertEqual(final.status, 'resolved')
+        self.assertEqual(final.note, 'original note')
+
+    def test_dirty_only_save_preserves_concurrent_field_update(self):
+        # Each UPDATE only contains the fields that instance actually
+        # changed, so neither writer overwrites the other's field.
+        WorkTicket._meta.only_save_dirty = True
+
+        final = self._concurrent_edits()
+        self.assertEqual(final.status, 'resolved')
+        self.assertEqual(final.note, 'note from operator A')
+
+    def test_explicit_only_save_preserves_concurrent_field_update(self):
+        # Same guarantee without flipping the model-level flag: scope each
+        # save to the fields the request actually modified.
+        WorkTicket._meta.only_save_dirty = False
+        ticket = WorkTicket.create(note='original note', status='open')
+
+        note_editor = WorkTicket.get_by_id(ticket.id)
+        note_editor.note = 'note from operator A'
+        note_editor.status = 'closed'  # Edited locally but not requested.
+        note_editor.save(only=[WorkTicket.note])
+
+        status_editor = WorkTicket.get_by_id(ticket.id)
+        status_editor.status = 'resolved'
+        status_editor.save(only=[WorkTicket.status])
+
+        final = WorkTicket.get_by_id(ticket.id)
+        self.assertEqual(final.note, 'note from operator A')
+        self.assertEqual(final.status, 'resolved')
+
+        # Fields outside the only=[...] list stay dirty and are not lost.
+        self.assertEqual(note_editor.dirty_field_names, ['status'])
 
 
 class TestFunctionCoerce(ModelTestCase):
